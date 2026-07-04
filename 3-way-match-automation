@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+3-WAY MATCH SYSTEM - AUTO-EMAIL VERSION
+PO vs DeliveryNote vs Invoice Reconciliation
+"""
+
+import urllib.request
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import time
+from datetime import datetime
+
+# ============ CONFIGURATION ============
+
+# Your Sheet ID (from Google Sheets URL)
+SHEET_ID = "18V7WeTrrS6LlHFRBocshTpz7i2nV_EAoiuTveXHTflE"
+
+# Gmail settings (REPLACE THESE WITH YOUR ACTUAL CREDENTIALS)
+GMAIL_USER = "abc123@gmail.com"        # ← REPLACE with your Gmail
+GMAIL_PASSWORD = "xxxxxxx"              # ← REPLACE with your App Password
+ALERT_EMAIL = "abc123@gmail.com"        # ← REPLACE with where to send alerts
+
+# Run settings
+RUN_INTERVAL = 86400  # 24 hours (change to 60 for 1-minute testing)
+
+# ============ READ GOOGLE SHEETS ============
+
+def read_sheet(sheet_name):
+    """Read a public Google Sheet as CSV"""
+    try:
+        url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        req = urllib.request.Request(url, headers=headers)
+        response = urllib.request.urlopen(req)
+        data = response.read().decode('utf-8')
+        
+        lines = data.strip().split('\n')
+        result = []
+        for line in lines:
+            parts = []
+            current = ''
+            in_quotes = False
+            for char in line:
+                if char == '"' and not in_quotes:
+                    in_quotes = True
+                elif char == '"' and in_quotes:
+                    in_quotes = False
+                elif char == ',' and not in_quotes:
+                    parts.append(current.strip())
+                    current = ''
+                else:
+                    current += char
+            parts.append(current.strip())
+            result.append(parts)
+        return result
+    except Exception as e:
+        print(f"❌ Error reading {sheet_name}: {e}")
+        return None
+
+# ============ SEND EMAIL ============
+
+def send_email(subject, body):
+    """Send email using Gmail SMTP"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_USER
+        msg['To'] = ALERT_EMAIL
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        print(f"📧 Email sent: {subject}")
+        return True
+    except Exception as e:
+        print(f"❌ Email failed: {e}")
+        return False
+
+# ============ RUN 3-WAY MATCH ============
+
+def run_match():
+    """Run the 3-way match and send email"""
+    
+    print(f"\n🔄 Running at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    po_data = read_sheet("PO")
+    dn_data = read_sheet("DeliveryNote")
+    inv_data = read_sheet("Invoice")
+    
+    if po_data is None or len(po_data) <= 1:
+        send_email("⚠️ 3-Way Match Error", "Could not read PO sheet.")
+        return False
+    
+    # Build maps
+    dn_map = {}
+    if dn_data:
+        for row in dn_data[1:]:
+            if len(row) >= 4:
+                key = row[1] + "|" + row[2]
+                dn_map[key] = row[3]
+    
+    inv_map = {}
+    if inv_data:
+        for row in inv_data[1:]:
+            if len(row) >= 5:
+                key = row[1] + "|" + row[2]
+                inv_map[key] = {'qty': row[3], 'price': row[4]}
+    
+    mismatches = []
+    matched = 0
+    
+    for row in po_data[1:]:
+        if len(row) < 5:
+            continue
+        
+        po_num = row[0]
+        item = row[1]
+        ordered = row[3]
+        price = row[4]
+        key = po_num + "|" + item
+        
+        received = dn_map.get(key, "MISSING")
+        invoice = inv_map.get(key, {'qty': 'MISSING', 'price': 'MISSING'})
+        
+        notes = []
+        is_mismatch = False
+        
+        if received == "MISSING":
+            notes.append("No delivery")
+            is_mismatch = True
+        elif str(received) != str(ordered):
+            notes.append(f"Qty: {ordered} vs {received}")
+            is_mismatch = True
+        
+        if invoice['qty'] == "MISSING":
+            notes.append("No invoice")
+            is_mismatch = True
+        else:
+            if str(invoice['qty']) != str(ordered):
+                notes.append(f"Inv qty: {ordered} vs {invoice['qty']}")
+                is_mismatch = True
+            if str(invoice['price']) != str(price):
+                notes.append(f"Price: {price} vs {invoice['price']}")
+                is_mismatch = True
+        
+        if is_mismatch:
+            mismatches.append({
+                'po': po_num,
+                'item': item,
+                'ordered': ordered,
+                'received': received,
+                'invoiced': invoice['qty'],
+                'price': price,
+                'inv_price': invoice['price'],
+                'notes': '; '.join(notes)
+            })
+        else:
+            matched += 1
+    
+    total = len(po_data) - 1
+    
+    # Send email
+    if mismatches:
+        body = f"""
+3-WAY MATCH REPORT
+================================
+📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+📊 Summary:
+- Total PO Lines: {total}
+- Fully Matched: {matched}
+- Mismatches Found: {len(mismatches)}
+- Match Rate: {round((matched/total)*100, 1) if total > 0 else 0}%
+
+🔴 MISMATCH DETAILS:
+"""
+        for m in mismatches:
+            body += f"""
+--------------------------------
+PO: {m['po']} | Item: {m['item']}
+  • Ordered Qty: {m['ordered']}
+  • Received Qty: {m['received']}
+  • Invoiced Qty: {m['invoiced']}
+  • PO Price: {m['price']}
+  • Invoice Price: {m['inv_price']}
+  • Issue: {m['notes']}
+"""
+        
+        send_email(f"🚨 {len(mismatches)} mismatches found", body)
+    else:
+        send_email("✅ ALL CLEAR!", f"""
+3-WAY MATCH REPORT
+================================
+📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+✅ ALL {total} PO lines matched perfectly!
+No discrepancies found.
+
+📊 Match Rate: 100%
+""")
+    
+    print(f"✅ Done at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return True
+
+# ============ MAIN LOOP (RUN FOREVER) ============
+
+if __name__ == "__main__":
+    print("="*70)
+    print("🚀 3-Way Match Automation System")
+    print("="*70)
+    print(f"📤 From: {GMAIL_USER}")
+    print(f"📥 To: {ALERT_EMAIL}")
+    print(f"⏰ Every: {RUN_INTERVAL//3600} hours")
+    print("="*70)
+    print("\n✅ Running... Press Ctrl+C to stop\n")
+    
+    run_count = 0
+    
+    while True:
+        try:
+            run_count += 1
+            print(f"\n{'='*70}")
+            print(f"▶️  RUN #{run_count} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'='*70}")
+            
+            run_match()
+            
+            print(f"\n⏳ Next run in {RUN_INTERVAL//3600} hours...")
+            time.sleep(RUN_INTERVAL)
+            
+        except KeyboardInterrupt:
+            print("\n\n🛑 Stopped by user.")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            print("🔄 Restarting in 60 seconds...")
+            time.sleep(60)
