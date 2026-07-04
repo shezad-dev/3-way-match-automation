@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-3-WAY MATCH SYSTEM - AUTO-EMAIL VERSION
-PO vs DeliveryNote vs Invoice Reconciliation
+3-Way Match System - Checks POs against delivery notes and invoices
+Runs 2 times, sends all mismatches via email
 """
 
 import urllib.request
@@ -10,27 +10,35 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time
 from datetime import datetime
+import os
 
-# ============ CONFIGURATION ============
+# ============ CONFIG ============
 
-# Your Sheet ID (from Google Sheets URL)
-SHEET_ID = "18V7WeTrrS6LlHFRBocshTpz7i2nV_EAoiuTveXHTflE"
+SHEET_ID = "1k1Hek8UbGDbg5s4MGBAGov1Tap0bGSjSS1kWtfcw0wQ"
 
-# Gmail settings (REPLACE THESE WITH YOUR ACTUAL CREDENTIALS)
-GMAIL_USER = "abc123@gmail.com"        # ← REPLACE with your Gmail
-GMAIL_PASSWORD = "xxxxxxx"              # ← REPLACE with your App Password
-ALERT_EMAIL = "abc123@gmail.com"        # ← REPLACE with where to send alerts
+# Get credentials from config file if it exists
+try:
+    from config import GMAIL_USER, GMAIL_PASSWORD, ALERT_EMAIL
+except ImportError:
+    # Fallback to environment variables
+    GMAIL_USER = os.environ.get('GMAIL_USER')
+    GMAIL_PASSWORD = os.environ.get('GMAIL_PASSWORD')
+    ALERT_EMAIL = os.environ.get('ALERT_EMAIL')
+    
+    if not all([GMAIL_USER, GMAIL_PASSWORD, ALERT_EMAIL]):
+        print("ERROR: Missing credentials!")
+        print("Create config.py with GMAIL_USER, GMAIL_PASSWORD, ALERT_EMAIL")
+        exit(1)
 
-# Run settings
-RUN_INTERVAL = 86400  # 24 hours (change to 60 for 1-minute testing)
+TOTAL_RUNS = 2
+RUN_INTERVAL = 60
 
-# ============ READ GOOGLE SHEETS ============
+# ============ READ SHEET ============
 
 def read_sheet(sheet_name):
-    """Read a public Google Sheet as CSV"""
     try:
         url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         req = urllib.request.Request(url, headers=headers)
         response = urllib.request.urlopen(req)
         data = response.read().decode('utf-8')
@@ -55,13 +63,12 @@ def read_sheet(sheet_name):
             result.append(parts)
         return result
     except Exception as e:
-        print(f"❌ Error reading {sheet_name}: {e}")
+        print(f"Error reading {sheet_name}: {e}")
         return None
 
 # ============ SEND EMAIL ============
 
 def send_email(subject, body):
-    """Send email using Gmail SMTP"""
     try:
         msg = MIMEMultipart()
         msg['From'] = GMAIL_USER
@@ -74,29 +81,36 @@ def send_email(subject, body):
         server.login(GMAIL_USER, GMAIL_PASSWORD)
         server.send_message(msg)
         server.quit()
-        
-        print(f"📧 Email sent: {subject}")
         return True
     except Exception as e:
-        print(f"❌ Email failed: {e}")
+        print(f"Email failed: {e}")
         return False
 
-# ============ RUN 3-WAY MATCH ============
+# ============ MAIN MATCH LOGIC ============
 
-def run_match():
-    """Run the 3-way match and send email"""
+def run_match(run_number):
+    print(f"\n{'='*70}")
+    print(f"Run #{run_number} at {datetime.now().strftime('%H:%M:%S')}")
+    print(f"{'='*70}")
     
-    print(f"\n🔄 Running at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Reading Google Sheets...")
     
     po_data = read_sheet("PO")
     dn_data = read_sheet("DeliveryNote")
     inv_data = read_sheet("Invoice")
     
-    if po_data is None or len(po_data) <= 1:
-        send_email("⚠️ 3-Way Match Error", "Could not read PO sheet.")
+    if not po_data or len(po_data) <= 1:
+        print("No PO data found!")
         return False
     
-    # Build maps
+    total_rows = len(po_data) - 1
+    print(f"PO: {total_rows} rows")
+    if dn_data:
+        print(f"DeliveryNote: {len(dn_data)-1} rows")
+    if inv_data:
+        print(f"Invoice: {len(inv_data)-1} rows")
+    
+    # Build lookup maps
     dn_map = {}
     if dn_data:
         for row in dn_data[1:]:
@@ -114,7 +128,13 @@ def run_match():
     mismatches = []
     matched = 0
     
-    for row in po_data[1:]:
+    print("\nAnalyzing...\n")
+    
+    # Process each PO line
+    for idx, row in enumerate(po_data[1:], 1):
+        if idx % 100 == 0:
+            print(f"Progress: {idx}/{total_rows} ({int(idx/total_rows*100)}%)")
+        
         if len(row) < 5:
             continue
         
@@ -130,6 +150,7 @@ def run_match():
         notes = []
         is_mismatch = False
         
+        # Check delivery note
         if received == "MISSING":
             notes.append("No delivery")
             is_mismatch = True
@@ -137,6 +158,7 @@ def run_match():
             notes.append(f"Qty: {ordered} vs {received}")
             is_mismatch = True
         
+        # Check invoice
         if invoice['qty'] == "MISSING":
             notes.append("No invoice")
             is_mismatch = True
@@ -163,80 +185,95 @@ def run_match():
             matched += 1
     
     total = len(po_data) - 1
+    mismatch_count = len(mismatches)
     
-    # Send email
-    if mismatches:
+    # Show summary
+    print("\n" + "="*70)
+    print("SUMMARY")
+    print("="*70)
+    print(f"Total PO Lines:   {total}")
+    print(f"Matched:          {matched}")
+    print(f"Mismatches:       {mismatch_count}")
+    print(f"Match Rate:       {round((matched/total)*100, 1) if total > 0 else 0}%")
+    print("="*70 + "\n")
+    
+    # Send email with all mismatches
+    if mismatch_count > 0:
+        print(f"Sending email with {mismatch_count} mismatches...")
+        
+        # Build email body
         body = f"""
-3-WAY MATCH REPORT
+3-WAY MATCH REPORT - RUN #{run_number}
 ================================
-📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-📊 Summary:
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Summary:
 - Total PO Lines: {total}
-- Fully Matched: {matched}
-- Mismatches Found: {len(mismatches)}
+- Matched: {matched}
+- Mismatches: {mismatch_count}
 - Match Rate: {round((matched/total)*100, 1) if total > 0 else 0}%
 
-🔴 MISMATCH DETAILS:
+ALL MISMATCHES:
 """
         for m in mismatches:
             body += f"""
 --------------------------------
 PO: {m['po']} | Item: {m['item']}
-  • Ordered Qty: {m['ordered']}
-  • Received Qty: {m['received']}
-  • Invoiced Qty: {m['invoiced']}
-  • PO Price: {m['price']}
-  • Invoice Price: {m['inv_price']}
-  • Issue: {m['notes']}
+  Ordered: {m['ordered']} | Received: {m['received']} | Invoiced: {m['invoiced']}
+  Issue: {m['notes']}
 """
         
-        send_email(f"🚨 {len(mismatches)} mismatches found", body)
-    else:
-        send_email("✅ ALL CLEAR!", f"""
-3-WAY MATCH REPORT
+        body += """
 ================================
-📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Results saved to phone.
+"""
+        
+        send_email(f"Run #{run_number}: {mismatch_count} mismatches", body)
+    else:
+        print("All matched! Sending all-clear email...")
+        body = f"""
+3-WAY MATCH REPORT - RUN #{run_number}
+================================
 
-✅ ALL {total} PO lines matched perfectly!
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+ALL {total} PO lines matched perfectly!
 No discrepancies found.
-
-📊 Match Rate: 100%
-""")
+"""
+        send_email(f"Run #{run_number}: ALL CLEAR!", body)
     
-    print(f"✅ Done at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Save to file
+    try:
+        filename = f"/storage/emulated/0/match_results_run{run_number}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        with open(filename, 'w') as f:
+            f.write(f"3-WAY MATCH - RUN #{run_number}\n")
+            f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+            f.write(f"Total: {total} | Matched: {matched} | Mismatches: {mismatch_count}\n\n")
+            for m in mismatches:
+                f.write(f"{m['po']} | {m['item']} | {m['notes']}\n")
+        print(f"Saved to: {filename}")
+    except:
+        pass
+    
     return True
 
-# ============ MAIN LOOP (RUN FOREVER) ============
+# ============ RUN ============
 
 if __name__ == "__main__":
+    print("3-Way Match System")
     print("="*70)
-    print("🚀 3-Way Match Automation System")
+    print(f"From: {GMAIL_USER}")
+    print(f"To: {ALERT_EMAIL}")
+    print(f"Runs: {TOTAL_RUNS}, {RUN_INTERVAL}s apart")
     print("="*70)
-    print(f"📤 From: {GMAIL_USER}")
-    print(f"📥 To: {ALERT_EMAIL}")
-    print(f"⏰ Every: {RUN_INTERVAL//3600} hours")
-    print("="*70)
-    print("\n✅ Running... Press Ctrl+C to stop\n")
+    print("\nPress Ctrl+C to stop\n")
     
-    run_count = 0
-    
-    while True:
-        try:
-            run_count += 1
-            print(f"\n{'='*70}")
-            print(f"▶️  RUN #{run_count} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"{'='*70}")
-            
-            run_match()
-            
-            print(f"\n⏳ Next run in {RUN_INTERVAL//3600} hours...")
+    for run in range(1, TOTAL_RUNS + 1):
+        run_match(run)
+        
+        if run < TOTAL_RUNS:
+            print(f"\nWaiting {RUN_INTERVAL} seconds...")
             time.sleep(RUN_INTERVAL)
-            
-        except KeyboardInterrupt:
-            print("\n\n🛑 Stopped by user.")
-            break
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            print("🔄 Restarting in 60 seconds...")
-            time.sleep(60)
+    
+    print("\nAll done! Check your email.")
